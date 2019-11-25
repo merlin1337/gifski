@@ -32,6 +32,7 @@ use clap::{App, Arg, AppSettings};
 use std::time::Duration;
 use std::path::{Path, PathBuf};
 use std::fs::File;
+use std::io::{BufRead, BufReader};
 use std::thread;
 use std::env;
 
@@ -92,6 +93,19 @@ fn bin_main() -> BinResult<()> {
                         .arg(Arg::with_name("quiet")
                             .long("quiet")
                             .help("Do not show a progress bar"))
+                        .arg(Arg::with_name("time-unit")
+                            .help("Amount of seconds that make up 1 time unit")
+                            .long("time-unit")
+                            .takes_value(true)
+                            .value_name("s")
+                            .default_value("0.001"))
+                        .arg(Arg::with_name("durations")
+                            .long("durations")
+                            .help("Per-frame durations in time units (See --time-unit)\nIf a file is specified, parses every line")
+                            .min_values(1)
+                            .empty_values(false)
+                            .value_name("file|num...")
+                            .use_delimiter(true))
                         .arg(Arg::with_name("FRAMES")
                             .help(VIDEO_FRAMES_ARG_HELP)
                             .min_values(1)
@@ -117,6 +131,18 @@ fn bin_main() -> BinResult<()> {
     let quiet = matches.is_present("quiet");
     let fps: usize = matches.value_of("fps").ok_or("Missing fps")?.parse().chain_err(|| "FPS must be a number")?;
 
+    let time_unit = value_t!(matches, "time-unit", f64).unwrap();
+    let mut durations: Vec<_> = matches.values_of("durations").unwrap_or_default().map(|s| s.to_string()).collect();
+    if durations.len() == 1 {
+        if let Ok(file) = File::open(&durations[0]) {
+            let reader = BufReader::new(file);
+            durations = reader.lines().map(|s| s.unwrap().trim().to_string()).collect();
+        } else {
+            Err(format!("File {} doesn't exist", &durations[0]))?;
+        }
+    }
+    let durations: Vec<_> = durations.into_iter().filter_map(|d| d.parse::<f64>().ok()).map(|d| (d*time_unit*100.0) as u16).collect();
+    
     if settings.quality < 20 {
         if settings.quality < 1 {
             Err("Quality too low")?;
@@ -132,7 +158,7 @@ fn bin_main() -> BinResult<()> {
     let mut decoder = if frames.len() == 1 {
         get_video_decoder(&frames[0])?
     } else {
-        Box::new(png::Lodecoder::new(frames, fps))
+        Box::new(png::Lodecoder::new(frames, fps, durations))
     };
 
     let mut progress: Box<dyn ProgressReporter> = if quiet {
