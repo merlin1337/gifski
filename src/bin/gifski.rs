@@ -12,8 +12,8 @@ use gifski;
 #[cfg(feature = "video")]
 extern crate ffmpeg;
 
-use wild;
 use natord;
+use wild;
 
 #[cfg(feature = "video")]
 mod ffmpeg_source;
@@ -24,17 +24,17 @@ use crate::source::*;
 use gifski::progress::{NoProgress, ProgressBar, ProgressReporter};
 
 mod error;
-use crate::error::*;
 use crate::error::ResultExt;
+use crate::error::*;
 
-use clap::{App, Arg, AppSettings};
+use clap::{App, AppSettings, Arg};
 
-use std::time::Duration;
-use std::path::{Path, PathBuf};
+use std::env;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
 use std::thread;
-use std::env;
+use std::time::Duration;
 
 #[cfg(feature = "video")]
 const VIDEO_FRAMES_ARG_HELP: &'static str = "one MP4/WebM video, or multiple PNG animation frames";
@@ -129,7 +129,7 @@ fn bin_main() -> BinResult<()> {
         fast: matches.is_present("fast"),
     };
     let quiet = matches.is_present("quiet");
-    let fps: usize = matches.value_of("fps").ok_or("Missing fps")?.parse().chain_err(|| "FPS must be a number")?;
+    let fps: f32 = matches.value_of("fps").ok_or("Missing fps")?.parse().chain_err(|| "FPS must be a number")?;
 
     let time_unit = value_t!(matches, "time-unit", f64).unwrap();
     let mut durations: Vec<_> = matches.values_of("durations").unwrap_or_default().map(|s| s.to_string()).collect();
@@ -156,7 +156,7 @@ fn bin_main() -> BinResult<()> {
     check_if_path_exists(&frames[0])?;
 
     let mut decoder = if frames.len() == 1 {
-        get_video_decoder(&frames[0])?
+        get_video_decoder(&frames[0], fps)?
     } else {
         Box::new(png::Lodecoder::new(frames, fps, durations))
     };
@@ -178,7 +178,8 @@ fn bin_main() -> BinResult<()> {
         decoder.collect(collector)
     });
 
-    let file = File::create(output_path).chain_err(|| format!("Can't write to {}", output_path.display()))?;
+    let file = File::create(output_path)
+        .chain_err(|| format!("Can't write to {}", output_path.display()))?;
     writer.write(file, &mut *progress)?;
     decode_thread.join().unwrap()?;
     progress.done(&format!("gifski created {}", output_path.display()));
@@ -208,12 +209,12 @@ fn parse_opt<T: ::std::str::FromStr<Err = ::std::num::ParseIntError>>(s: Option<
 }
 
 #[cfg(feature = "video")]
-fn get_video_decoder(path: &Path) -> BinResult<Box<Source + Send>> {
-    Ok(Box::new(ffmpeg_source::FfmpegDecoder::new(path)?))
+fn get_video_decoder(path: &Path, fps: f32) -> BinResult<Box<dyn Source + Send>> {
+    Ok(Box::new(ffmpeg_source::FfmpegDecoder::new(path, fps)?))
 }
 
 #[cfg(not(feature = "video"))]
-fn get_video_decoder(_: &Path) -> BinResult<Box<dyn Source + Send>> {
+fn get_video_decoder(_: &Path, _fps: f32) -> BinResult<Box<dyn Source + Send>> {
     Err(r"Video support is permanently disabled in this executable.
 
 To enable video decoding you need to recompile gifski from source with:

@@ -1,21 +1,17 @@
+use crate::error::*;
 use crate::source::*;
 use gifski::Collector;
-use crate::error::*;
 use std::path::PathBuf;
 
 pub struct Lodecoder {
     frames: Vec<PathBuf>,
-    fps: usize,
+    fps: f32,
     durations: Vec<u16>
 }
 
 impl Lodecoder {
-    pub fn new(frames: Vec<PathBuf>, fps: usize, durations: Vec<u16>) -> Self {  
-        Self {
-            frames,
-            fps,
-            durations
-        }
+    pub fn new(frames: Vec<PathBuf>, fps: f32, durations: Vec<u16>) -> Self {
+        Self { frames, fps, durations }
     }
 }
 
@@ -28,12 +24,11 @@ impl Source for Lodecoder {
         let mut duration = self.durations.drain(..);
         
         for (i, frame) in self.frames.drain(..).enumerate() {
-             if let Some(d) = duration.next() {
+            if let Some(d) = duration.next() {
                 dest.add_frame_png_file(i, frame, d)?;
-             } else {
-                let delay = ((i + 1) * 100 / self.fps) - (i * 100 / self.fps); // See telecine/pulldown.                    
-                dest.add_frame_png_file(i, frame, delay as u16)?;
-             }
+            } else {
+                dest.add_frame_png_file(i, frame, i as f64 / self.fps as f64)?;
+            }
         }
         Ok(())
     }
