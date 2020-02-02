@@ -141,7 +141,7 @@ fn bin_main() -> BinResult<()> {
             Err(format!("File {} doesn't exist", &durations[0]))?;
         }
     }
-    let durations: Vec<_> = durations.into_iter().filter_map(|d| d.parse::<f64>().ok()).map(|d| (d*time_unit*100.0) as u16).collect();
+    let durations: Vec<_> = durations.into_iter().filter_map(|d| d.parse::<f64>().ok()).map(|d| (d*time_unit)).collect();
     
     if settings.quality < 20 {
         if settings.quality < 1 {
