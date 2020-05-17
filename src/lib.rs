@@ -17,11 +17,8 @@
 */
 #![doc(html_logo_url = "https://gif.ski/icon.png")]
 
-use gif;
-use imagequant;
-use lodepng;
+#[macro_use] extern crate quick_error;
 
-#[macro_use] extern crate error_chain;
 use imagequant::*;
 use imgref::*;
 use rgb::*;
@@ -41,7 +38,7 @@ mod encodegifsicle;
 use std::io::prelude::*;
 use std::path::PathBuf;
 use std::sync::Arc;
-
+use std::sync::mpsc;
 use std::thread;
 
 type DecodedImage = CatResult<(ImgVec<RGBA8>, f64)>;
@@ -102,6 +99,11 @@ trait Encoder {
     }
 }
 
+enum FrameMessage {
+    Write(Arc<GIFFrame>),
+    Skipped,
+}
+
 /// Start new encoding
 ///
 /// Encoding is multi-threaded, and the `Collector` and `Writer`
@@ -128,6 +130,8 @@ impl Collector {
     /// Set each frame (index) only once, but you can set them in any order.
     ///
     /// Presentation timestamp is time in seconds (since file start at 0) when this frame is to be displayed.
+    ///
+    /// If the first frame doesn't start at pts=0, the delay will be used for the last frame.
     pub fn add_frame_rgba(&mut self, frame_index: usize, image: ImgVec<RGBA8>, presentation_timestamp: f64) -> CatResult<()> {
         self.queue.push(frame_index, Ok((Self::resized_binary_alpha(image, self.width, self.height), presentation_timestamp)))
     }
@@ -137,11 +141,13 @@ impl Collector {
     /// Frame index starts at 0.
     ///
     /// Presentation timestamp is time in seconds (since file start at 0) when this frame is to be displayed.
+    ///
+    /// If the first frame doesn't start at pts=0, the delay will be used for the last frame.
     pub fn add_frame_png_file(&mut self, frame_index: usize, path: PathBuf, presentation_timestamp: f64) -> CatResult<()> {
         let width = self.width;
         let height = self.height;
         let image = lodepng::decode32_file(&path)
-            .chain_err(|| format!("Can't load {}", path.display()))?;
+            .map_err(|err| Error::PNG(format!("Can't load {}: {}", path.display(), err)))?;
 
         self.queue.push(frame_index, Ok((Self::resized_binary_alpha(ImgVec::new(image.buffer, image.width, image.height), width, height), presentation_timestamp)))
     }
@@ -218,11 +224,13 @@ impl Writer {
         Ok((Img::new(pal_img, img.width(), img.height()), pal))
     }
 
-    fn write_frames(write_queue_iter: OrdQueueIter<Arc<GIFFrame>>, enc: &mut dyn Encoder, settings: &Settings, reporter: &mut dyn ProgressReporter) -> CatResult<()> {
+    fn write_frames(write_queue_iter: mpsc::Receiver<FrameMessage>, enc: &mut dyn Encoder, settings: &Settings, reporter: &mut dyn ProgressReporter) -> CatResult<()> {
         for f in write_queue_iter {
-            enc.write_frame(&f, settings)?;
+            if let FrameMessage::Write(f) = f {
+                enc.write_frame(&f, settings)?;
+            }
             if !reporter.increase() {
-                return Err(ErrorKind::Aborted.into());
+                return Err(Error::Aborted.into());
             }
         }
         enc.finish()?;
@@ -259,7 +267,7 @@ impl Writer {
     }
 
     fn write_with_encoder(mut self, encoder: &mut dyn Encoder, reporter: &mut dyn ProgressReporter) -> CatResult<()> {
-        let (write_queue, write_queue_iter) = ordqueue::new(4);
+        let (write_queue, write_queue_iter) = mpsc::sync_channel(4);
         let queue_iter = self.queue_iter.take().unwrap();
         let settings = self.settings;
         let make_thread = thread::spawn(move || {
@@ -270,46 +278,63 @@ impl Writer {
         Ok(())
     }
 
-    fn make_frames(queue_iter: OrdQueueIter<DecodedImage>, mut write_queue: OrdQueue<Arc<GIFFrame>>, settings: &Settings) -> CatResult<()> {
-        let mut decode_iter = queue_iter.enumerate().map(|(i, tmp)| tmp.map(|(image, delay)| (i, image, delay)));
-
+    fn make_frames(mut decode_iter: OrdQueueIter<DecodedImage>, write_queue: mpsc::SyncSender<FrameMessage>, settings: &Settings) -> CatResult<()> {
         let mut screen = None;
         let mut next_frame = decode_iter.next().transpose()?;
 
+        let mut last_frame_delay_s = None;
+        let mut pts_in_delay_units = 0_u64;
         let mut importance_map = match &next_frame {
-            Some(next_frame) => vec![255_u8; next_frame.1.buf().len()],
-            None => return Err("Found no usable frames to encode".into()),
+            Some((next_frame, pts)) => {
+                // If the first frame doesn't start at 0 (or actually with 1/100th because that's min delay)
+                // interpret it as the delay between (looped) the last and the first frame.
+                if *pts >= 1./100. {
+                    last_frame_delay_s = Some(*pts);
+                    // Shift all frames by this pts so that frame 0 always starts at 0
+                    pts_in_delay_units = (100.0*(*pts)).floor() as _;
+                }
+                vec![255_u8; next_frame.buf().len()]
+            },
+            None => {
+                return Err(Error::NoFrames)
+            },
         };
 
         let mut previous_frame_dispose = gif::DisposalMethod::Background;
         let mut previous_frame_delay = 3;
-        let mut pts_in_delay_units = 0_u64;
-
-        while let Some((i, image, _)) = {
+        let mut i = 0;
+        while let Some((image, _)) = {
             // that's not the while loop, that block gets the next element
             let curr_frame = next_frame.take();
             next_frame = decode_iter.next().transpose()?;
             curr_frame
         } {
             // To convert PTS to delay it's necessary to know when the next frame is to be displayed
-            let delay = if let Some((_, _, next_pts)) = next_frame {
+            let delay = if let Some(next_pts) = next_frame.as_ref().map(|(_, pts)| *pts).or_else(|| {
+                    last_frame_delay_s.map(|s| pts_in_delay_units as f64 / 100.0 + s)
+                }) {
                 let next_pts_in_delay_units = (next_pts * 100.0).round() as u64;
                 if next_pts_in_delay_units > pts_in_delay_units {
                     (next_pts_in_delay_units - pts_in_delay_units).min(10000) as u16
                 } else {
-                    continue; // skip frames with duplicate/invalid PTS
+                    // skip frames with duplicate/invalid PTS
+                    if next_frame.is_some() {
+                        write_queue.send(FrameMessage::Skipped).map_err(|_| Error::ThreadSend)?;
+                    }
+                    continue;
                 }
             } else {
-                previous_frame_delay // for the last frame just assume constant framerate
+                // for the last frame just assume constant framerate
+                previous_frame_delay
             };
             pts_in_delay_units += u64::from(delay);
             previous_frame_delay = delay;
 
             let mut dispose = gif::DisposalMethod::Keep;
-            if let Some((_, ref next, _)) = next_frame {
+            if let Some((ref next, _)) = next_frame {
                 if next.width() != image.width() || next.height() != image.height() {
-                    return Err(format!("Frame {} has wrong size ({}×{}, expected {}×{})", i+1,
-                        next.width(), next.height(), image.width(), image.height()).into());
+                    return Err(Error::WrongSize(format!("Frame {} has wrong size ({}×{}, expected {}×{})", i+1,
+                        next.width(), next.height(), image.width(), image.height())));
                 }
 
                 debug_assert_eq!(next.width(), image.width());
@@ -371,7 +396,8 @@ impl Writer {
                 delay,
             });
 
-            write_queue.push(i, frame.clone())?;
+            write_queue.send(FrameMessage::Write(frame.clone())).map_err(|_| Error::ThreadSend)?;
+            i += 1;
             screen.blit(Some(&frame.pal), dispose, 0, 0, frame.image.as_ref(), transparent_index)?;
         }
 
